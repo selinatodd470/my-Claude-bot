@@ -262,19 +262,43 @@ def summarize_conversation(user_id: int):
 #  Ver5 新增：分句发送
 # ═══════════════════════════════════════
 async def send_split_messages(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
-    """按段落拆分回复，逐条发送。"""
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    """智能拆分回复，逐条发送。"""
+    # 第一优先：按双换行拆
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    
+    # 如果只有一段，尝试按单换行拆
+    if len(parts) <= 1:
+        parts = [p.strip() for p in text.split("\n") if p.strip()]
+    
+    # 如果还是只有一段且超过 20 字，按中文标点拆
+    if len(parts) <= 1 and len(text) > 150:
+        import re
+        # 在句号/问号/感叹号后拆分，保留标点
+        segments = re.split(r'(?<=[。！？])\s*', text)
+        segments = [s.strip() for s in segments if s.strip()]
+        # 合并过短的句子（目标每条 0-50 字）
+        parts = []
+        buf = ""
+        for s in segments:
+            if buf and len(buf) + len(s) > 120:
+                parts.append(buf)
+                buf = s
+            else:
+                buf = buf + s if buf else s
+        if buf:
+            parts.append(buf)
 
-    if len(paragraphs) <= 1:
+    # 只有一条就直接发
+    if len(parts) <= 1:
         await context.bot.send_message(chat_id=chat_id, text=text)
         return
 
-    # 合并过短的段落（<100字）
+    # 合并过短的段落
     merged = []
     buf = ""
-    for p in paragraphs:
-        if buf and len(buf) + len(p) < 100:
-            buf += "\n\n" + p
+    for p in parts:
+        if buf and len(buf) + len(p) < 80:
+            buf += "\n" + p
         else:
             if buf:
                 merged.append(buf)
