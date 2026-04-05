@@ -1,14 +1,15 @@
 import os
-import asyncio
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-import anthropic
+from openai import OpenAI
 
-# 从环境变量读取，不要在代码里直接填key
+# ===== 环境变量（Railway 中配置，切换供应商只改这三个） =====
 TG_TOKEN = os.environ.get("TG_TOKEN")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL")      # e.g. https://api.openai.com/v1
+LLM_API_KEY = os.environ.get("LLM_API_KEY")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514")  # 默认值可改
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
 # 每个用户的对话历史
 conversation_history = {}
@@ -41,14 +42,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
         max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=conversation_history[user_id]
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *conversation_history[user_id]
+        ]
     )
 
-    assistant_message = response.content[0].text
+    assistant_message = response.choices[0].message.content
 
     conversation_history[user_id].append({
         "role": "assistant",
@@ -61,7 +64,7 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot启动了")
+    print(f"Bot启动 | 模型: {LLM_MODEL} | 端点: {LLM_BASE_URL}")
     app.run_polling()
 
 if __name__ == "__main__":
