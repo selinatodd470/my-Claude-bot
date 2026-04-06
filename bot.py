@@ -205,7 +205,10 @@ async def proactive_message(context: ContextTypes.DEFAULT_TYPE):
     try:
         resp = client.chat.completions.create(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_BASE},
+                {"role": "user", "content": prompt}
+            ],
             max_tokens=150,
         )
         text = resp.choices[0].message.content.strip()
@@ -258,7 +261,10 @@ async def silence_check(context: ContextTypes.DEFAULT_TYPE):
     try:
         resp = client.chat.completions.create(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_BASE},
+                {"role": "user", "content": prompt}
+            ],
             max_tokens=100,
         )
         text = resp.choices[0].message.content.strip()
