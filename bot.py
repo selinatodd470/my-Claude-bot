@@ -117,7 +117,31 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     text = job.data["text"]
     rid = job.data["reminder_id"]
     repeating = job.data.get("repeating", False)
-    await context.bot.send_message(chat_id=chat_id, text=f"⏰ 提醒：{text}")
+
+    # 让 LLM 用自然语气重新表达提醒
+    now_str = datetime.now(TZ).strftime("%H:%M")
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "你是Selina的个人助理。现在需要提醒她一件事。"
+                    "用简短、自然、有温度的语气提醒，像朋友发消息一样，可参考对话中的上下文。"
+                    "不要用'提醒'这个词开头，不要加emoji前缀。"
+                    "一两句话就好，可以根据时间点加点关心的话。"
+                    f"当前时间：{now_str}"
+                )},
+                {"role": "user", "content": f"提醒内容：{text}"}
+            ],
+            max_tokens=150,
+        )
+        natural_text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"提醒美化失败: {e}")
+        natural_text = f"⏰ {text}"  # 失败时回退到原始格式
+
+    await context.bot.send_message(chat_id=chat_id, text=natural_text)
+
     if not repeating:
         db_deactivate_once(rid)
 
