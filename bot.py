@@ -13,6 +13,7 @@ LLM_API_KEY = os.environ["LLM_API_KEY"]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL   = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 DB_PATH     = os.environ.get("DB_PATH", "/app/data/bot.db")
+MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "0"))  # 复用已有环境变量
 TZ          = timezone(timedelta(hours=8))  # Asia/Shanghai
 
 logging.basicConfig(level=logging.INFO)
@@ -35,9 +36,10 @@ SYSTEM_PROMPT_BASE = (
 # ═══ 内存数据 ═══
 conversation_history: dict[int, list] = {}      # user_id -> messages
 conversation_summaries: dict[int, str] = {}     # user_id -> summary text
-HISTORY_MAX = 16          # 触发摘要的阈值
-HISTORY_KEEP = 10         # 摘要后保留的最近消息数
-SUMMARY_MAX_CHARS = 300   # 摘要目标长度
+last_message_time: dict[int, datetime] = {}     # Ver6: user_id -> last msg time
+HISTORY_MAX = 16
+HISTORY_KEEP = 10
+SUMMARY_MAX_CHARS = 300
 
 # ═══════════════════════════════════════
 #  SQLite 初始化
@@ -109,7 +111,7 @@ def load_all_summaries():
     return {uid: s for uid, s in rows}
 
 # ═══════════════════════════════════════
-#  提醒功能（与 Ver4 相同）
+#  Ver6: 自然提醒（LLM 美化 + 写入对话历史）
 # ═══════════════════════════════════════
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -118,7 +120,6 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     rid = job.data["reminder_id"]
     repeating = job.data.get("repeating", False)
 
-    # 让 LLM 用自然语气重新表达提醒
     now_str = datetime.now(TZ).strftime("%H:%M")
     try:
         resp = client.chat.completions.create(
@@ -126,7 +127,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
             messages=[
                 {"role": "system", "content": (
                     "你是Selina的个人助理。现在需要提醒她一件事。"
-                    "用简短、自然、有温度的语气提醒，像朋友发消息一样，可参考对话中的上下文。"
+                    "用简短、自然、有温度的语气提醒，像朋友发消息一样。"
                     "不要用'提醒'这个词开头，不要加emoji前缀。"
                     "一两句话就好，可以根据时间点加点关心的话。"
                     f"当前时间：{now_str}"
@@ -138,9 +139,18 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         natural_text = resp.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"提醒美化失败: {e}")
-        natural_text = f"⏰ {text}"  # 失败时回退到原始格式
+        natural_text = f"⏰ {text}"
 
     await context.bot.send_message(chat_id=chat_id, text=natural_text)
+
+    # Ver6: 写入对话历史，避免记忆断点
+    user_id = chat_id
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    conversation_history[user_id].append({
+        "role": "assistant",
+        "content": natural_text
+    })
 
     if not repeating:
         db_deactivate_once(rid)
@@ -160,6 +170,116 @@ def schedule_reminder(app, rid, chat_id, time_str, text, repeating):
         delay = (target_dt - now).total_seconds()
         app.job_queue.run_once(send_reminder, when=delay, data=job_data, name=job_name)
 
+# ═══════════════════════════════════════
+#  Ver6: 主动消息（早安/午饭/晚安/沉默检测）
+# ═══════════════════════════════════════
+async def proactive_message(context: ContextTypes.DEFAULT_TYPE):
+    """主动消息：根据场景类型生成自然语气的关心消息。"""
+    job = context.job
+    chat_id = job.data["chat_id"]
+    msg_type = job.data["type"]
+    user_id = job.data.get("user_id", chat_id)
+
+    summary = conversation_summaries.get(user_id, "")
+    now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M %A")
+
+    type_hints = {
+        "morning": "早安问候，简短温暖，可以提一下今天是星期几，如果有最近聊过的事可以提一句",
+        "lunch": "提醒吃午饭喝水，轻松自然，别太啰嗦",
+        "goodnight": "提醒该睡觉了，温柔但坚定，如果很晚了语气可以更直接",
+    }
+    hint = type_hints.get(msg_type, "自然地打个招呼")
+
+    prompt = (
+        f"你是Selina的个人助理。现在需要主动给她发一条消息。\n"
+        f"场景：{hint}\n"
+        f"当前时间：{now_str}\n"
+        f"{'她最近聊过的内容摘要：' + summary if summary else '（暂无最近对话记录）'}\n\n"
+        f"要求：\n"
+        f"- 一两句话就好，像朋友发微信\n"
+        f"- 可以结合她最近聊的内容，但不要硬凑\n"
+        f"- 不要用'提醒'这个词\n"
+        f"- 不要加emoji前缀"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+        )
+        text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"主动消息生成失败: {e}")
+        return  # 失败就不发，不打扰
+
+    await context.bot.send_message(chat_id=chat_id, text=text)
+
+    # 写入对话历史
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    conversation_history[user_id].append({
+        "role": "assistant",
+        "content": text
+    })
+
+async def silence_check(context: ContextTypes.DEFAULT_TYPE):
+    """沉默检测：超过4小时没聊天，在工作时间内主动搭话。"""
+    job = context.job
+    chat_id = job.data["chat_id"]
+    user_id = job.data.get("user_id", chat_id)
+
+    now = datetime.now(TZ)
+    # 只在 10:00-22:00 之间触发
+    if now.hour < 10 or now.hour >= 22:
+        return
+
+    last_time = last_message_time.get(user_id)
+    if last_time is None:
+        return  # 从没聊过，不打扰
+
+    silence_hours = (now - last_time).total_seconds() / 3600
+    if silence_hours < 4:
+        return  # 还没到4小时
+
+    summary = conversation_summaries.get(user_id, "")
+    now_str = now.strftime("%H:%M")
+
+    prompt = (
+        f"你是Selina的个人助理。她已经 {silence_hours:.0f} 小时没有发消息了。\n"
+        f"现在是 {now_str}，主动关心一下她。\n"
+        f"{'她最近聊过的内容摘要：' + summary if summary else ''}\n\n"
+        f"要求：\n"
+        f"- 简短自然，一句话就好\n"
+        f"- 可以问她在忙什么，或者提醒她休息一下\n"
+        f"- 不要太正式，像朋友发消息"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100,
+        )
+        text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"沉默检测消息生成失败: {e}")
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text=text)
+
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    conversation_history[user_id].append({
+        "role": "assistant",
+        "content": text
+    })
+    # 更新时间，避免重复触发
+    last_message_time[user_id] = now
+
+# ═══════════════════════════════════════
+#  启动初始化
+# ═══════════════════════════════════════
 async def post_init(app: Application):
     # 恢复对话摘要
     summaries = load_all_summaries()
@@ -176,6 +296,43 @@ async def post_init(app: Application):
             logger.error(f"恢复提醒 #{rid} 失败: {e}")
     logger.info(f"从数据库恢复了 {restored} 个提醒")
 
+    # Ver6: 注册主动消息任务
+    if MY_CHAT_ID:
+        uid = MY_CHAT_ID
+        # 早安 8:00
+        app.job_queue.run_daily(
+            proactive_message,
+            time=time(hour=8, minute=0, tzinfo=TZ),
+            data={"chat_id": uid, "user_id": uid, "type": "morning"},
+            name="proactive_morning"
+        )
+        # 午饭 12:30
+        app.job_queue.run_daily(
+            proactive_message,
+            time=time(hour=12, minute=30, tzinfo=TZ),
+            data={"chat_id": uid, "user_id": uid, "type": "lunch"},
+            name="proactive_lunch"
+        )
+        # 晚安 23:30
+        app.job_queue.run_daily(
+            proactive_message,
+            time=time(hour=23, minute=30, tzinfo=TZ),
+            data={"chat_id": uid, "user_id": uid, "type": "goodnight"},
+            name="proactive_goodnight"
+        )
+        # 沉默检测：每小时检查一次
+        app.job_queue.run_repeating(
+            silence_check,
+            interval=3600,
+            first=60,
+            data={"chat_id": uid, "user_id": uid},
+            name="silence_check"
+        )
+        logger.info(f"已注册主动消息任务，chat_id={uid}")
+
+# ═══════════════════════════════════════
+#  提醒命令
+# ═══════════════════════════════════════
 async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _set_reminder(update, context, repeating=True)
 
@@ -243,22 +400,18 @@ async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"已取消提醒 #{rid}")
 
 # ═══════════════════════════════════════
-#  Ver5 新增：对话摘要滚动
+#  对话摘要滚动（同 Ver5）
 # ═══════════════════════════════════════
 def summarize_conversation(user_id: int):
-    """当历史超过阈值时，调用 LLM 压缩旧消息为摘要。"""
     history = conversation_history.get(user_id, [])
     if len(history) <= HISTORY_MAX:
         return
-
     old_messages = history[:-HISTORY_KEEP]
     keep_messages = history[-HISTORY_KEEP:]
-
     old_text = "\n".join(
         f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
         for m in old_messages
     )
-
     existing_summary = conversation_summaries.get(user_id, "")
     prompt = (
         f"请将以下对话压缩为不超过{SUMMARY_MAX_CHARS}字的中文摘要，"
@@ -267,7 +420,6 @@ def summarize_conversation(user_id: int):
     if existing_summary:
         prompt += f"之前的摘要：\n{existing_summary}\n\n"
     prompt += f"新的对话内容：\n{old_text}"
-
     try:
         resp = client.chat.completions.create(
             model=LLM_MODEL,
@@ -277,24 +429,20 @@ def summarize_conversation(user_id: int):
         summary = resp.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"摘要生成失败: {e}")
-        summary = existing_summary  # 失败时保留旧摘要
-
+        summary = existing_summary
     conversation_summaries[user_id] = summary
     conversation_history[user_id] = keep_messages
     save_summary_to_db(user_id, summary)
     logger.info(f"用户 {user_id} 对话已摘要，压缩 {len(old_messages)} 条 → 保留 {len(keep_messages)} 条")
 
 # ═══════════════════════════════════════
-#  Ver5 新增：分句发送
+#  分句发送（同 Ver5）
 # ═══════════════════════════════════════
 async def send_split_messages(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
-    """按 LLM 标记的 ||| 分隔符拆分发送。"""
     parts = [p.strip() for p in text.split("|||") if p.strip()]
-    
     if len(parts) <= 1:
         await context.bot.send_message(chat_id=chat_id, text=text)
         return
-    
     for part in parts:
         await context.bot.send_message(chat_id=chat_id, text=part)
         await asyncio.sleep(0.6)
@@ -312,10 +460,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conversation_history[user_id].append({"role": "user", "content": user_text})
 
-    # ── Ver5: 触发摘要滚动 ──
+    # Ver6: 记录最后消息时间（用于沉默检测）
+    last_message_time[user_id] = datetime.now(TZ)
+
     summarize_conversation(user_id)
 
-    # ── Ver5: 构建 system prompt（时间注入 + 摘要 + 提醒） ──
     now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M %A")
     system_prompt = f"{SYSTEM_PROMPT_BASE}\n当前时间：{now_str}"
 
@@ -323,7 +472,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if summary:
         system_prompt += f"\n\n之前的对话摘要：\n{summary}"
 
-    # 注入当前活跃提醒
     rows = db_get_active_reminders()
     user_rows = [(rid, ts, txt, rep) for rid, cid, ts, txt, rep in rows if cid == chat_id]
     if user_rows:
@@ -347,8 +495,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assistant_message = f"出错了：{e}"
 
     conversation_history[user_id].append({"role": "assistant", "content": assistant_message})
-
-    # ── Ver5: 分句发送 ──
     await send_split_messages(chat_id, assistant_message, context)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,7 +512,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════
 def main():
     init_db()
-    logger.info(f"Bot启动 | 模型: {LLM_MODEL} | 端点: {LLM_BASE_URL} | 数据库: {DB_PATH}")
+    logger.info(f"Bot启动(Ver6) | 模型: {LLM_MODEL} | 端点: {LLM_BASE_URL} | 数据库: {DB_PATH}")
     app = Application.builder().token(TG_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("remind", remind_cmd))
