@@ -3,11 +3,14 @@ import logging
 import sqlite3
 import asyncio
 import html
+import json
 from datetime import datetime, time, timedelta, timezone
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram.constants import ParseMode
+from sleep_schema import WAKEUP_TOOLS
+from notion_sleep import log_wakeup_record
 
 # ═══ 环境变量 ═══
 TG_TOKEN    = os.environ["TG_TOKEN"]
@@ -39,8 +42,8 @@ SYSTEM_PROMPT_BASE = (
 conversation_history: dict[int, list] = {}
 conversation_summaries: dict[int, str] = {}
 last_message_time: dict[int, datetime] = {}
-HISTORY_MAX = 30       # Ver7: 16→30
-HISTORY_KEEP = 20      # Ver7: 10→20
+HISTORY_MAX = 30
+HISTORY_KEEP = 20
 SUMMARY_MAX_CHARS = 300
 
 # ═══════════════════════════════════════
@@ -63,7 +66,6 @@ def init_db():
         summary TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )""")
-    # Ver7: last_message_time 持久化
     c.execute("""CREATE TABLE IF NOT EXISTS last_message_times (
         user_id INTEGER PRIMARY KEY,
         timestamp TEXT NOT NULL
@@ -117,7 +119,6 @@ def load_all_summaries():
     conn.close()
     return {uid: s for uid, s in rows}
 
-# Ver7: last_message_time 持久化函数
 def save_last_message_time(user_id, dt):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -199,7 +200,7 @@ def schedule_reminder(app, rid, chat_id, time_str, text, repeating):
         app.job_queue.run_once(send_reminder, when=delay, data=job_data, name=job_name)
 
 # ═══════════════════════════════════════
-#  主动消息（早安/午饭/晚安/沉默检测）
+#  主动消息
 # ═══════════════════════════════════════
 async def proactive_message(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -226,7 +227,7 @@ async def proactive_message(context: ContextTypes.DEFAULT_TYPE):
         f"- 一两句话就好，像朋友发微信\n"
         f"- 可以结合她最近聊的内容，但不要硬凑\n"
         f"- 不要用'提醒'这个词\n"
-        f"- 不要加emoji前缀"
+        f"- 根据前面聊过的话题，必要时加emoji前缀"
     )
 
     try:
@@ -299,7 +300,7 @@ async def silence_check(context: ContextTypes.DEFAULT_TYPE):
         conversation_history[user_id] = []
     conversation_history[user_id].append({"role": "assistant", "content": text})
     last_message_time[user_id] = now
-    save_last_message_time(user_id, now)  # Ver7: 持久化
+    save_last_message_time(user_id, now)
 
 # ═══════════════════════════════════════
 #  启动初始化
@@ -309,7 +310,6 @@ async def post_init(app: Application):
     conversation_summaries.update(summaries)
     logger.info(f"从数据库恢复了 {len(summaries)} 条对话摘要")
 
-    # Ver7: 恢复 last_message_time
     times = load_all_last_message_times()
     last_message_time.update(times)
     logger.info(f"从数据库恢复了 {len(times)} 条最后消息时间")
@@ -459,13 +459,12 @@ def summarize_conversation(user_id: int):
     logger.info(f"用户 {user_id} 对话已摘要，压缩 {len(old_messages)} 条 → 保留 {len(keep_messages)} 条")
 
 # ═══════════════════════════════════════
-#  Ver7: 思考链 → Telegram expandable blockquote
+#  思考链 → Telegram expandable blockquote
 # ═══════════════════════════════════════
 async def send_thinking_message(chat_id: int, thinking: str, context: ContextTypes.DEFAULT_TYPE):
-    """将思考链以 Telegram expandable blockquote 形式发送。"""
     if not thinking or not thinking.strip():
         return
-    max_len = 3800  # 留余量给 HTML 标签
+    max_len = 3800
     if len(thinking) > max_len:
         thinking = thinking[:max_len] + "…"
     escaped = html.escape(thinking)
@@ -495,14 +494,13 @@ async def send_split_messages(chat_id: int, text: str, context: ContextTypes.DEF
         await asyncio.sleep(0.6)
 
 # ═══════════════════════════════════════
-#  核心消息处理
+#  核心消息处理（含 tool calling）
 # ═══════════════════════════════════════
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_text = update.message.text
 
-    # Ver7: 引用消息注入上下文
     reply_msg = update.message.reply_to_message
     if reply_msg and reply_msg.text:
         quoted = reply_msg.text
@@ -515,7 +513,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conversation_history[user_id].append({"role": "user", "content": user_text})
 
-    # Ver7: 记录 + 持久化最后消息时间
     now = datetime.now(TZ)
     last_message_time[user_id] = now
     save_last_message_time(user_id, now)
@@ -540,33 +537,83 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messages = [{"role": "system", "content": system_prompt}] + conversation_history[user_id]
 
+    # ── 1st LLM call: 带 tools，让模型决定是否提取醒后数据 ──
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=messages,
+            tools=WAKEUP_TOOLS,
+            tool_choice="auto",
             max_tokens=1024,
         )
         choice = response.choices[0]
-        assistant_message = choice.message.content
-
-        # Ver7: 提取思考链（DeepSeek reasoning_content）
-        thinking = getattr(choice.message, "reasoning_content", None)
-        if thinking is None:
-            extra = getattr(choice.message, "model_extra", {}) or {}
-            thinking = extra.get("reasoning_content")
+        msg = choice.message
     except Exception as e:
         logger.error(f"LLM 调用失败: {e}")
-        assistant_message = f"出错了：{e}"
-        thinking = None
+        await context.bot.send_message(chat_id=chat_id, text=f"出错了：{e}")
+        return
+
+    # ── 处理 function calling ──
+    if msg.tool_calls:
+        # 把 assistant 的 tool_calls 消息写入历史
+        assistant_entry = {"role": "assistant", "content": msg.content or ""}
+        assistant_entry["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
+        conversation_history[user_id].append(assistant_entry)
+
+        for tc in msg.tool_calls:
+            if tc.function.name == "log_wakeup_record":
+                args = json.loads(tc.function.arguments)
+                logger.info(f"醒后记录: {json.dumps(args, ensure_ascii=False)}")
+
+                try:
+                    log_wakeup_record(args)
+                    tool_result = "✅ 醒后数据已成功写入 Notion。"
+                except Exception as e:
+                    logger.error(f"Notion 写入失败: {e}")
+                    tool_result = f"⚠️ 数据已提取但写入 Notion 失败：{e}"
+
+                conversation_history[user_id].append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_result,
+                })
+
+        # ── 2nd LLM call: 带 tool 结果，生成自然回复 ──
+        try:
+            response2 = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "system", "content": system_prompt}] + conversation_history[user_id],
+                max_tokens=512,
+            )
+            choice2 = response2.choices[0]
+            assistant_message = choice2.message.content
+
+            thinking = getattr(choice2.message, "reasoning_content", None)
+            if thinking is None:
+                extra = getattr(choice2.message, "model_extra", {}) or {}
+                thinking = extra.get("reasoning_content")
+        except Exception as e:
+            logger.error(f"第二次 LLM 调用失败: {e}")
+            assistant_message = "已记录。"
+            thinking = None
+    else:
+        # 普通对话，无 tool call
+        assistant_message = msg.content
+        thinking = getattr(msg, "reasoning_content", None)
+        if thinking is None:
+            extra = getattr(msg, "model_extra", {}) or {}
+            thinking = extra.get("reasoning_content")
 
     conversation_history[user_id].append({"role": "assistant", "content": assistant_message})
 
-    # Ver7: 先发思考链（如果有）
     if thinking:
         await send_thinking_message(chat_id, thinking, context)
 
     await send_split_messages(chat_id, assistant_message, context)
 
+# ═══════════════════════════════════════
+#  start 命令
+# ═══════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "在的。\n\n"
@@ -574,7 +621,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/remind HH:MM 内容 — 每日提醒\n"
         "/once HH:MM 内容 — 一次性提醒\n"
         "/reminders — 查看所有提醒\n"
-        "/cancel 编号 — 取消提醒"
+        "/cancel 编号 — 取消提醒\n\n"
+        "我还会自动记录你的醒后数据（睡眠状态、用药、咖啡因等）。"
     )
 
 # ═══════════════════════════════════════
@@ -582,7 +630,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════
 def main():
     init_db()
-    logger.info(f"Bot启动(Ver7) | 模型: {LLM_MODEL} | 端点: {LLM_BASE_URL} | 数据库: {DB_PATH}")
+    logger.info(f"Bot8启动 | 模型: {LLM_MODEL} | 端点: {LLM_BASE_URL} | 数据库: {DB_PATH}")
     app = Application.builder().token(TG_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("remind", remind_cmd))
