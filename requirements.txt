@@ -1,4 +1,4 @@
 openai
 python-telegram-bot[job-queue]
 APScheduler
-request
+requests
