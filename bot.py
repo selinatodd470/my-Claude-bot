@@ -537,6 +537,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messages = [{"role": "system", "content": system_prompt}] + conversation_history[user_id]
 
+    def _get_thinking(msg):
+        t = getattr(msg, "reasoning_content", None)
+        if t is None:
+            extra = getattr(msg, "model_extra", {}) or {}
+            t = extra.get("reasoning_content")
+        return t
+
     # ── 1st LLM call: 带 tools，让模型决定是否提取醒后数据 ──
     try:
         response = client.chat.completions.create(
@@ -548,6 +555,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         choice = response.choices[0]
         msg = choice.message
+        first_thinking = _get_thinking(msg)
     except Exception as e:
         logger.error(f"LLM 调用失败: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"出错了：{e}")
@@ -555,9 +563,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 处理 function calling ──
     if msg.tool_calls:
-        # 把 assistant 的 tool_calls 消息写入历史
         assistant_entry = {"role": "assistant", "content": msg.content or ""}
         assistant_entry["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
+        if first_thinking:
+            assistant_entry["reasoning_content"] = first_thinking
         conversation_history[user_id].append(assistant_entry)
 
         for tc in msg.tool_calls:
@@ -598,11 +607,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             choice2 = response2.choices[0]
             assistant_message = choice2.message.content
-
-            thinking = getattr(choice2.message, "reasoning_content", None)
-            if thinking is None:
-                extra = getattr(choice2.message, "model_extra", {}) or {}
-                thinking = extra.get("reasoning_content")
+            thinking = _get_thinking(choice2.message)
         except Exception as e:
             logger.error(f"第二次 LLM 调用失败: {e}")
             assistant_message = "已记录。"
@@ -610,14 +615,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # 普通对话，无 tool call
         assistant_message = msg.content
-        thinking = getattr(msg, "reasoning_content", None)
-        if thinking is None:
-            extra = getattr(msg, "model_extra", {}) or {}
-            thinking = extra.get("reasoning_content")
+        thinking = first_thinking
 
-    conversation_history[user_id].append({"role": "assistant", "content": assistant_message})
-
+    # 存到历史（DeepSeek 要求保留 reasoning_content）
+    entry = {"role": "assistant", "content": assistant_message}
     if thinking:
+        entry["reasoning_content"] = thinking
+    conversation_history[user_id].append(entry)
+
+    # 展示思考链：仅当有实质性内容时才发送
+    if thinking and len(thinking.strip()) > 120:
         await send_thinking_message(chat_id, thinking, context)
 
     await send_split_messages(chat_id, assistant_message, context)
