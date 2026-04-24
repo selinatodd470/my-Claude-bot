@@ -544,7 +544,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=messages,
             tools=WAKEUP_TOOLS,
             tool_choice="auto",
-            max_tokens=1024,
+            max_tokens=2048,
         )
         choice = response.choices[0]
         msg = choice.message
@@ -562,7 +562,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for tc in msg.tool_calls:
             if tc.function.name == "log_wakeup_record":
-                args = json.loads(tc.function.arguments)
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON 解析失败: {e}, raw={tc.function.arguments!r}")
+                    tool_result = f"⚠️ 模型返回的数据格式有误，未能解析：{e}"
+                    conversation_history[user_id].append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_result,
+                    })
+                    continue
+
                 logger.info(f"醒后记录: {json.dumps(args, ensure_ascii=False)}")
 
                 try:
